@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { Client } = require("pg");
-const axios = require("axios");
+const { spawn } = require("child_process");
 
 // Create a new PostgreSQL client using environment variables
 const client = new Client({
@@ -11,25 +11,34 @@ const client = new Client({
   port: process.env.DB_PORT,
 });
 
-// Function to generate vectors using Hugging Face API
+// Function to generate vectors using Python script
 async function generateVectors(text) {
-  const response = await axios.post(
-    "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
-    {
-      inputs: [text],
-      options: {
-        wait_for_model: true,
-      },
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.HUGGING_FACE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
+  return new Promise((resolve, reject) => {
+    const pythonProcess = spawn("python3", ["generate_vectors.py", text]);
 
-  return response.data[0];
+    let result = "";
+
+    pythonProcess.stdout.on("data", (data) => {
+      result += data.toString();
+    });
+
+    pythonProcess.stderr.on("data", (data) => {
+      console.error(`Python Error: ${data}`);
+    });
+
+    pythonProcess.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`Python process exited with code ${code}`));
+        return;
+      }
+      try {
+        const vector = JSON.parse(result.trim());
+        resolve(vector);
+      } catch (error) {
+        reject(new Error(`Failed to parse vector result: ${error.message}`));
+      }
+    });
+  });
 }
 
 // Connect to the PostgreSQL database
@@ -38,14 +47,18 @@ client
   .then(async () => {
     console.log("Connected to PostgreSQL database");
 
-    // Create a table with company, location, company_vector, and location_vector
+    // Create a table using FLOAT[] instead of vector type
     const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS company_data (
+      CREATE TABLE IF NOT EXISTS lynx_contacts (
         id SERIAL PRIMARY KEY,
-        company VARCHAR(255),
-        location VARCHAR(255),
-        company_vector FLOAT8[],
-        location_vector FLOAT8[]
+        name TEXT,
+        position TEXT,
+        company TEXT,
+        location TEXT,
+        experience INTEGER,
+        revenue BIGINT,
+        position_vector FLOAT[],
+        company_vector FLOAT[]
       );
     `;
 
@@ -53,35 +66,47 @@ client
     console.log("Table created successfully");
 
     // Example data
+    const name = "John Doe";
+    const position = "Software Engineer";
     const company = "TechCorp";
     const location = "New York";
+    const experience = 5;
+    const revenue = 1000000;
 
     try {
-      // Generate vectors for company and location
+      // Generate vectors for position and company
       console.log("Generating vectors...");
+      const positionVector = await generateVectors(position);
       const companyVector = await generateVectors(company);
-      const locationVector = await generateVectors(location);
 
       // Insert data into the table
       const insertDataQuery = `
-        INSERT INTO company_data (company, location, company_vector, location_vector)
-        VALUES ($1, $2, $3, $4);
+        INSERT INTO lynx_contacts (
+          name, position, company, location, experience, revenue, 
+          position_vector, company_vector
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
       `;
 
       await client.query(insertDataQuery, [
+        name,
+        position,
         company,
         location,
+        experience,
+        revenue,
+        positionVector,
         companyVector,
-        locationVector,
       ]);
       console.log("Data inserted successfully");
 
       // Retrieve and display the inserted data
       const selectQuery = `
-        SELECT company, location, 
-               array_length(company_vector, 1) as company_vector_length,
-               array_length(location_vector, 1) as location_vector_length
-        FROM company_data
+        SELECT 
+          name, position, company, location,
+          array_length(position_vector, 1) as position_vector_length,
+          array_length(company_vector, 1) as company_vector_length
+        FROM lynx_contacts
         ORDER BY id DESC
         LIMIT 1;
       `;
@@ -90,10 +115,7 @@ client
       console.log("\nInserted Data:");
       console.log(result.rows[0]);
     } catch (error) {
-      console.error(
-        "Error details:",
-        error.response ? error.response.data : error.message
-      );
+      console.error("Error:", error.message);
       throw error;
     }
   })
